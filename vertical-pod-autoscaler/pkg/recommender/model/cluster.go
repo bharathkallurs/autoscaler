@@ -316,6 +316,11 @@ func (cluster *ClusterState) MakeAggregateStateKey(pod *PodState, containerName 
 	}
 }
 
+// GetAggregateStateMap returns the current aggregateStateMap in cluster state object
+func (cluster *ClusterState) GetAggregateStateMap() aggregateContainerStatesMap {
+	return cluster.aggregateStateMap
+}
+
 // aggregateStateKeyForContainerID returns the AggregateStateKey for the ContainerID.
 // The pod with the corresponding PodID must already be present in the ClusterState.
 func (cluster *ClusterState) aggregateStateKeyForContainerID(containerID ContainerID) AggregateStateKey {

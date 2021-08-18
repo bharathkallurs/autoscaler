@@ -194,3 +194,14 @@ func TestRecordOOMInNewWindow(t *testing.T) {
 	test.mockMemoryHistogram.On("AddSample", 2400.0*mb, 1.0, memoryAggregationWindowEnd)
 	assert.NoError(t, test.container.RecordOOM(testTimestamp.Add(2*memoryAggregationInterval), ResourceAmount(1000*mb)))
 }
+
+func TestRecordOOMSampleAndCountTotalSamples(t *testing.T) {
+	test := newContainerTest()
+	memoryAggregationWindowEnd := testTimestamp.Add(GetAggregationsConfig().MemoryAggregationInterval)
+	// Increase the memory by 20%
+	test.mockMemoryHistogram.On("AddSample", 1200.0*mb, 1.0, memoryAggregationWindowEnd)
+	assert.NoError(t, test.container.RecordOOM(testTimestamp, ResourceAmount(1000*mb)))
+
+	// Check if TotalSamplesCount is calculated for memory sample addition
+	assert.Equal(t, 1, test.aggregateContainerState.TotalSamplesCount)
+}

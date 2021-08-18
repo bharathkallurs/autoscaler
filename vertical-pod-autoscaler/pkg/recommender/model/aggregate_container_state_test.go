@@ -153,6 +153,26 @@ func TestAggregateContainerStateSaveToCheckpoint(t *testing.T) {
 	assert.Len(t, checkpoint.MemoryHistogram.BucketWeights, 2)
 }
 
+func TestTotalSamplesCountMemorySamplesOnly(t *testing.T) {
+	cluster := NewClusterState()
+	cluster.AddOrUpdatePod(testPodID1, testLabels, apiv1.PodRunning)
+	otherLabels := labels.Set{"label-2": "value-2"}
+	cluster.AddOrUpdatePod(testPodID2, otherLabels, apiv1.PodRunning)
+
+	// Create a single container with memory samples only
+	container := ContainerID{testPodID1, "app-A"}
+	assert.NoError(t, cluster.AddOrUpdateContainer(container, testRequest))
+
+	// Add 5 Memory usage samples to the container.
+	for i := 1; i <= 5; i++ {
+		assert.NoError(t, addTestMemorySample(cluster, container, 2e9)) // app-A
+	}
+
+	aggregateResources := AggregateStateByContainerName(cluster.aggregateStateMap)
+	assert.Equal(t, 5, aggregateResources["app-A"].TotalSamplesCount)
+
+}
+
 func TestAggregateContainerStateLoadFromCheckpointFailsForVersionMismatch(t *testing.T) {
 	checkpoint := vpa_types.VerticalPodAutoscalerCheckpointStatus{
 		Version: "foo",
