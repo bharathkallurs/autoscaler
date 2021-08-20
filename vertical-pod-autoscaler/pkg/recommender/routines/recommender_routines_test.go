@@ -5,30 +5,26 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	apiv1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/logic"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/util"
-	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
-	"k8s.io/klog"
 )
 
-// getOOMParam defines a function return type to handle tests
-// for both OOMBumpUpRatio and OOMMinBUmp
-type getOOMParam func(float64) float64
-
 var (
-	testPodID1       = model.PodID{Namespace: "namespace-1", PodName: "pod-1"}
-	testLabels       = map[string]string{"label-1": "value-1"}
-	timeLayout       = "2006-01-02 15:04:05"
-	testTimestamp, _ = time.Parse(timeLayout, "2021-08-11 14:53:05")
-	testRequest      = model.Resources{
+	config                 = model.GetAggregationsConfig()
+	testPodID1             = model.PodID{Namespace: "namespace-1", PodName: "pod-1"}
+	testLabels             = map[string]string{"label-1": "value-1"}
+	testCtrName            = "app-1"
+	timeLayout             = "2006-01-02 15:04:05"
+	testTimestamp, _       = time.Parse(timeLayout, "2021-08-11 14:53:05")
+	maxRelativeError       = 0.05
+	maxAllowedMemory       = 5e10
+	recommenderTestRequest = model.Resources{
 		model.ResourceCPU:    model.CPUAmountFromCores(0.5),
 		model.ResourceMemory: model.MemoryAmountFromBytes(100),
 	}
-	testLimit = model.Resources{ // Setting limits to 3x of testRequest
+	recommenderTestLimit = model.Resources{ // Setting limits to 3x of testRequest
 		model.ResourceCPU:    model.CPUAmountFromCores(1.0),
 		model.ResourceMemory: model.MemoryAmountFromBytes(300),
 	}
@@ -40,228 +36,411 @@ var (
 	}
 )
 
-func addTestMemorySample(cluster *model.ClusterState, container model.ContainerID, memoryBytes float64, timeStamp time.Time) error {
-	sample := model.ContainerUsageSampleWithKey{
-		Container: container,
-		ContainerUsageSample: model.ContainerUsageSample{
-			MeasureStart: timeStamp,
-			Usage:        model.MemoryAmountFromBytes(memoryBytes),
-			Request:      testRequest[model.ResourceMemory],
-			Resource:     model.ResourceMemory,
-		},
-	}
-	return cluster.AddSample(&sample)
+type resourceSample struct {
+	value     float64
+	weight    float64
+	timeStamp time.Time
 }
 
-func addTestCPUHistogram(samples []float64, weight float64, testTimeStamp time.Time, options util.HistogramOptions) util.Histogram {
-	cpuHistogram := util.NewHistogram(options)
-	for _, sample := range samples {
-		cpuHistogram.AddSample(sample, weight, testTimestamp)
+func addResourceSample(samples []resourceSample, histogram *util.Histogram) {
+	for i := range samples {
+		(*histogram).AddSample(samples[i].value, samples[i].weight, samples[i].timeStamp)
 	}
-
-	return cpuHistogram
 }
 
-func addTestMemoryHistogram(samples []float64, weight float64, timeStamp time.Time, options util.HistogramOptions) util.Histogram {
-	memoryHistogram := util.NewHistogram(options)
-	for _, sample := range samples {
-		memoryHistogram.AddSample(sample, weight, testTimestamp)
-	}
-
-	return memoryHistogram
+func addTestCPUHistogram(cpuHistogram util.Histogram, cpuSamples []resourceSample) {
+	addResourceSample(cpuSamples, &cpuHistogram)
 }
 
-func surgeSampleBasedMemoryEstimation(memorySample float64, maxAllowedMemory float64,
-	cpuHistogram util.Histogram, memoryPeaksHistogram util.Histogram,
-	cpuPercentile float64, memPercentile float64, fn getOOMParam) (model.Resources, int) {
-	surgeSamplesCount := 1
-	var resourceEstimation model.Resources
-	for {
-		if memorySample < maxAllowedMemory {
-			memorySample = fn(memorySample)
-		}
-		memoryPeaksHistogram.AddSample(memorySample, 1.0, testTimestamp)
-		resourceEstimation = GetPercentileResourceEstimation(cpuPercentile, memPercentile,
-			cpuHistogram, memoryPeaksHistogram)
-
-		if resourceEstimation[model.ResourceMemory] >= model.ResourceAmount(memorySample) {
-			break
-		}
-		surgeSamplesCount++
-	}
-
-	return resourceEstimation, surgeSamplesCount
+func addTestMemoryHistogram(memoryHistogram util.Histogram, memorySamples []resourceSample) {
+	addResourceSample(memorySamples, &memoryHistogram)
 }
 
-func GetPercentileResourceEstimation(cpuPercentile float64, memPercentile float64,
-	cpuHistogram util.Histogram, memoryHistogram util.Histogram) model.Resources {
-
-	estimator := logic.NewPercentileEstimator(cpuPercentile, memPercentile)
-
-	return estimator.GetResourceEstimation(
-		&model.AggregateContainerState{
+func getTestContainerStateMap(cpuHistogram util.Histogram, memoryHistogram util.Histogram) model.ContainerNameToAggregateStateMap {
+	return model.ContainerNameToAggregateStateMap{
+		testCtrName: &model.AggregateContainerState{
 			AggregateCPUUsage:    cpuHistogram,
 			AggregateMemoryPeaks: memoryHistogram,
-		})
-}
-
-func getTestVPAObj(cluster *model.ClusterState, container model.ContainerID) *model.Vpa {
-	vpa := test.VerticalPodAutoscaler().WithName(testVpaID.VpaName).
-		WithNamespace(testVpaID.Namespace).WithContainer(container.ContainerName).WithUpdateMode(testUpdateModeAuto).Get()
-
-	labelSelector, _ := metav1.ParseToLabelSelector(testSelectorStr)
-	parsedSelector, _ := metav1.LabelSelectorAsSelector(labelSelector)
-	err := cluster.AddOrUpdateVpa(vpa, parsedSelector)
-	if err != nil {
-		klog.Fatalf("AddOrUpdateVpa() failed: %v", err)
+		},
 	}
-
-	return cluster.Vpas[testVpaID]
 }
 
-// Verifies that recommendation does not occur and remains Nil
-// if only memory samples are added onto the aggregate container state
-// histogram. The variable TotalSamplesCount is counted only for CPU
-// samples and a similar for memory should be introduced.
-func TestRecommendationForZeroTotalSamplesCount(t *testing.T) {
-	cluster := model.NewClusterState()
-	cluster.AddOrUpdatePod(testPodID1, testLabels, apiv1.PodRunning)
-	container := model.ContainerID{PodID: testPodID1, ContainerName: "app-A"}
+func doTestRecommender(
+	cpuHistogram, memoryHistogram util.Histogram,
+	initialCPUSamples, initialMemorySamples []resourceSample,
+	recommender logic.PodResourceRecommender,
+	containerStateMap model.ContainerNameToAggregateStateMap,
+	assertInitialRecommendations func(logic.RecommendedPodResources),
+	doTestAction func(),
+	assertPostTestActionRecommendations func(),
+) {
+	addTestCPUHistogram(cpuHistogram, initialCPUSamples)          // Add CPU histogram
+	addTestMemoryHistogram(memoryHistogram, initialMemorySamples) // Add memory histogram
 
-	assert.NoError(t, cluster.AddOrUpdateContainer(container, testRequest))
-	assert.NoError(t, addTestMemorySample(cluster, container, 2e9, testTimestamp))
+	// Get initial recommendation
+	recommendedResources := recommender.GetRecommendedPodResources(containerStateMap)
 
-	pod := cluster.Pods[testPodID1]
-	aggregateStateKey := cluster.MakeAggregateStateKey(pod, "app-A")
-	aggregateResources := cluster.GetAggregateStateMap()
-	// Note: This returns TotalSamplesCount as 0 as we are only adding memory sample
-	// This is handled in another test case (TestTotalSamplesCountMemorySamplesOnly).
-	// Ignorning and continuing to seek recommendations for now. Fix it to equal to 1.
-	assert.Equal(t, 0, aggregateResources[aggregateStateKey].TotalSamplesCount)
-
-	recommender := logic.CreatePodResourceRecommender()
-	vpaObj := getTestVPAObj(cluster, container)
-	recommendedResources := recommender.GetRecommendedPodResources(GetContainerNameToAggregateStateMap(vpaObj))
-	assert.NotEmpty(t, recommendedResources)
-
+	assertInitialRecommendations(recommendedResources) // Assert initial recommendation
+	doTestAction()                                     // Actual test logic
+	assertPostTestActionRecommendations()              // Assert post test results
 }
 
-// Verifies the number of samples it takes for the current
-// VPA recommender estimation to beat the current surge in usage.
-// The surge is determined and samples w.r.t that is added using
-// model.OOMBumpUpRatio
 func TestAddMemorySurgeWithOOMBumpUpRatio(t *testing.T) {
-	config := model.GetAggregationsConfig()
-	maxAllowedMemory := 5e10
-	cpuSamples := []float64{1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
-	cpuHistogram := addTestCPUHistogram(cpuSamples, 1.0, testTimestamp, config.CPUHistogramOptions)
+	var recommendedResources logic.RecommendedPodResources
+	cpuHistogram := util.NewHistogram(config.CPUHistogramOptions)
+	memoryHistogram := util.NewHistogram(config.MemoryHistogramOptions)
+	surgeSamplesCount := 1
 
-	var memSamples []float64
-	for i := 0; i < 20; i++ {
-		memSamples = append(memSamples, 1e6)
+	var cpuSamples []resourceSample
+	cpuCores := []float64{0.5, 0.5, 0.55, 0.55, 0.6, 0.6, 0.65, 0.65, 0.7, 0.7}
+	cpuTimeStamp := testTimestamp
+	for i := 0; i < 10; i++ {
+		cpuTimeStamp = cpuTimeStamp.Add(1 * time.Minute)
+		cpuSamples = append(cpuSamples, resourceSample{cpuCores[i], 1.0, cpuTimeStamp})
 	}
-	memoryPeaksHistogram := addTestMemoryHistogram(memSamples, 1.0, testTimestamp, config.MemoryHistogramOptions)
 
-	ResourcePercentile := 0.9 // Same as in podResourceRecommender for target estimator
-	resourceEstimation := GetPercentileResourceEstimation(ResourcePercentile, ResourcePercentile,
-		cpuHistogram, memoryPeaksHistogram)
-	maxRelativeError := 0.05 // Allow 5% relative error to account for histogram rounding.
-	assert.InEpsilon(t, 1e7, model.BytesFromMemoryAmount(resourceEstimation[model.ResourceMemory]), maxRelativeError)
+	var memSamples []resourceSample
+	memorySample := 1e6
+	memTimeStamp := testTimestamp
+	for i := 0; i < 20; i++ {
+		if i%2 == 0 {
+			memorySample += float64(100 * i)
+		} else {
+			memorySample -= float64(100 * i)
+		}
 
-	// Adding sudden surge sample to memory histogram
-	memoryPeaksHistogram.AddSample(4e10, 1.0, testTimestamp)
-	resourceEstimation = GetPercentileResourceEstimation(ResourcePercentile, ResourcePercentile,
-		cpuHistogram, memoryPeaksHistogram)
+		memTimeStamp = memTimeStamp.Add(1 * time.Minute)
+		memSamples = append(memSamples, resourceSample{memorySample, 1.0, memTimeStamp})
+	}
 
-	// still recommends 1e6 value as memory recommendation.
-	// Note: VPA recommender doesn't immediately respond to
-	// surge of memory resource
-	assert.InEpsilon(t, 1e7, model.BytesFromMemoryAmount(resourceEstimation[model.ResourceMemory]), maxRelativeError)
+	containerStateMap := getTestContainerStateMap(cpuHistogram, memoryHistogram)
+	recommender := logic.CreatePodResourceRecommender()
 
-	surgeSample := 4e10
-	// add a closure to increase memorySample by 1.2 times as defined in model.OOMBumpUpRatio
-	getOOMBumpUpRatio := func(memorySample float64) float64 { return memorySample * model.OOMBumpUpRatio }
-	resourceEstimation, surgeSamplesCount := surgeSampleBasedMemoryEstimation(surgeSample, maxAllowedMemory,
-		cpuHistogram, memoryPeaksHistogram, ResourcePercentile, ResourcePercentile, getOOMBumpUpRatio)
+	doTestRecommender(
+		cpuHistogram,
+		memoryHistogram,
+		cpuSamples,
+		memSamples,
+		recommender,
+		containerStateMap,
+		func(recommendedResources logic.RecommendedPodResources) {
+			assert.InEpsilon(t, 2.62144000e8, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
+		},
+		func() {
+			addTestMemoryHistogram(memoryHistogram,
+				[]resourceSample{
+					{4e10, 1.0, testTimestamp},
+				})
 
-	assert.InEpsilon(t, 60080658359, model.BytesFromMemoryAmount(resourceEstimation[model.ResourceMemory]), maxRelativeError)
-	assert.Greater(t, 3, surgeSamplesCount) // Fail if greater than 3 surge samples collected
+			containerStateMap[testCtrName].AggregateCPUUsage = cpuHistogram
+			containerStateMap[testCtrName].AggregateMemoryPeaks = memoryHistogram
+			recommendedResources = recommender.GetRecommendedPodResources(containerStateMap)
+			assert.InEpsilon(t, 2.62144000e8, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
 
+			surgeSample := resourceSample{
+				value:     4e10,
+				weight:    1.0,
+				timeStamp: testTimestamp,
+			}
+			addTestMemoryHistogram(memoryHistogram, []resourceSample{surgeSample})
+
+			for {
+				if surgeSample.value < maxAllowedMemory {
+					surgeSample.value *= model.OOMBumpUpRatio
+				}
+				addTestMemoryHistogram(memoryHistogram, []resourceSample{surgeSample})
+				containerStateMap[testCtrName].AggregateCPUUsage = cpuHistogram
+				containerStateMap[testCtrName].AggregateMemoryPeaks = memoryHistogram
+				recommendedResources = recommender.GetRecommendedPodResources(containerStateMap)
+				assert.NotEmpty(t, recommendedResources)
+
+				if recommendedResources[testCtrName].Target[model.ResourceMemory] >= model.ResourceAmount(surgeSample.value) {
+					break
+				}
+				surgeSamplesCount++
+			}
+		},
+		func() {
+			assert.InEpsilon(t, 6.9092757112e10, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
+			assert.Greater(t, 3, surgeSamplesCount) // Fail if greater than 3 surge samples collected
+		},
+	)
 }
 
-// Verifies the number of samples it takes for the current
-// VPA recommender estimation to beat the current surge in usage.
-// The surge is determined and samples w.r.t that is added using
-// model.OOMMinBumpUp
 func TestAddMemorySurgeWithOOMMinBump(t *testing.T) {
-	config := model.GetAggregationsConfig()
-	maxAllowedMemory := 5e10
-	cpuSamples := []float64{1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
-	cpuHistogram := addTestCPUHistogram(cpuSamples, 1.0, testTimestamp, config.CPUHistogramOptions)
+	var recommendedResources logic.RecommendedPodResources
+	cpuHistogram := util.NewHistogram(config.CPUHistogramOptions)
+	memoryHistogram := util.NewHistogram(config.MemoryHistogramOptions)
+	surgeSamplesCount := 1
 
-	var memSamples []float64
-	for i := 0; i < 40; i++ {
-		memSamples = append(memSamples, 1e6)
+	var cpuSamples []resourceSample
+	cpuCores := []float64{0.5, 0.5, 0.55, 0.55, 0.6, 0.6, 0.65, 0.65, 0.7, 0.7}
+	cpuTimeStamp := testTimestamp
+	for i := 0; i < 10; i++ {
+		cpuTimeStamp = cpuTimeStamp.Add(1 * time.Minute)
+		cpuSamples = append(cpuSamples, resourceSample{cpuCores[i], 1.0, cpuTimeStamp})
 	}
-	memoryPeaksHistogram := addTestMemoryHistogram(memSamples, 1.0, testTimestamp, config.MemoryHistogramOptions)
 
-	ResourcePercentile := 0.9 // Same as in podResourceRecommender for target estimator
-	resourceEstimation := GetPercentileResourceEstimation(ResourcePercentile, ResourcePercentile,
-		cpuHistogram, memoryPeaksHistogram)
-	maxRelativeError := 0.05 // Allow 5% relative error to account for histogram rounding.
-	assert.InEpsilon(t, 1e7, model.BytesFromMemoryAmount(resourceEstimation[model.ResourceMemory]), maxRelativeError)
+	var memSamples []resourceSample
+	memorySample := 1e6
+	memTimeStamp := testTimestamp
+	for i := 0; i < 40; i++ {
+		if i%2 == 0 {
+			memorySample += float64(100 * i)
+		} else {
+			memorySample -= float64(100 * i)
+		}
 
-	// Adding sudden surge sample to memory histogram
-	memoryPeaksHistogram.AddSample(4e10, 1.0, testTimestamp)
-	resourceEstimation = GetPercentileResourceEstimation(ResourcePercentile, ResourcePercentile,
-		cpuHistogram, memoryPeaksHistogram)
+		memTimeStamp = memTimeStamp.Add(1 * time.Minute)
+		memSamples = append(memSamples, resourceSample{memorySample, 1.0, memTimeStamp})
+	}
 
-	// still recommends 1e6 value as memory recommendation.
-	// Note: VPA recommender doesn't immediately respond to
-	// surge of memory resource
-	assert.InEpsilon(t, 1e7, model.BytesFromMemoryAmount(resourceEstimation[model.ResourceMemory]), maxRelativeError)
+	containerStateMap := getTestContainerStateMap(cpuHistogram, memoryHistogram)
+	recommender := logic.CreatePodResourceRecommender()
 
-	surgeSample := 4e10
-	// add a closure to increase memorySample by 100MB as defined in model.OOMMinBumUp
-	getOOMBumpUpRatio := func(memorySample float64) float64 { return memorySample + model.OOMMinBumpUp }
-	resourceEstimation, surgeSamplesCount := surgeSampleBasedMemoryEstimation(surgeSample, maxAllowedMemory,
-		cpuHistogram, memoryPeaksHistogram, ResourcePercentile, ResourcePercentile, getOOMBumpUpRatio)
+	doTestRecommender(
+		cpuHistogram,
+		memoryHistogram,
+		cpuSamples,
+		memSamples,
+		recommender,
+		containerStateMap,
+		func(recommendedResources logic.RecommendedPodResources) {
+			assert.InEpsilon(t, 2.62144000e8, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
+		},
+		func() {
+			addTestMemoryHistogram(memoryHistogram,
+				[]resourceSample{
+					{4e10, 1.0, testTimestamp},
+				})
 
-	assert.InEpsilon(t, 40600322346, model.BytesFromMemoryAmount(resourceEstimation[model.ResourceMemory]), maxRelativeError)
-	assert.Greater(t, 3, surgeSamplesCount) // Fail if greater than 3 surge samples collected
+			containerStateMap[testCtrName].AggregateCPUUsage = cpuHistogram
+			containerStateMap[testCtrName].AggregateMemoryPeaks = memoryHistogram
+			recommendedResources = recommender.GetRecommendedPodResources(containerStateMap)
+			assert.InEpsilon(t, 2.62144000e8, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
 
+			surgeSample := resourceSample{
+				value:     4e10,
+				weight:    1.0,
+				timeStamp: testTimestamp,
+			}
+			addTestMemoryHistogram(memoryHistogram, []resourceSample{surgeSample})
+
+			for {
+				if surgeSample.value < maxAllowedMemory {
+					surgeSample.value += model.OOMMinBumpUp
+				}
+				addTestMemoryHistogram(memoryHistogram, []resourceSample{surgeSample})
+
+				recommendedResources = recommender.GetRecommendedPodResources(containerStateMap)
+				assert.NotEmpty(t, recommendedResources)
+
+				if recommendedResources[testCtrName].Target[model.ResourceMemory] >= model.ResourceAmount(surgeSample.value) {
+					break
+				}
+
+				surgeSamplesCount++
+			}
+		},
+		func() {
+			assert.InEpsilon(t, 4.6690370697e10, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
+			assert.Greater(t, 3, surgeSamplesCount) // Fail if greater than 3 surge samples collected
+		},
+	)
 }
 
-// Showcases the need of containerState.RecordOOM like function for
-// recording CPU throttle information which should be added to CPU
-// histogram if the CPU usage is constantly above current pod limits set.
-// CPU throttle information recorded should later be bumping the CPU sample
-// similar to containerState.RecordOOM to ensure higher recommendation is
-// provided for preventing CPU starvation
 func TestRecordCPUThrottlingInformation(t *testing.T) {
-	config := model.GetAggregationsConfig()
-	// include CPU samples greater than current limits to showcase throttle
-	cpuSamples := []float64{0.9, 0.95, 1.0, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8, 1.9}
-	cpuHistogram := addTestCPUHistogram(cpuSamples, 1.0, testTimestamp, config.CPUHistogramOptions)
+	var resourceRecommendation, cpuThrottleLimit float64
+	var recommendedResources logic.RecommendedPodResources
 
-	var memSamples []float64
-	for i := 0; i < 20; i++ {
-		memSamples = append(memSamples, 1e6)
+	cpuHistogram := util.NewHistogram(config.CPUHistogramOptions)
+	memoryHistogram := util.NewHistogram(config.MemoryHistogramOptions)
+
+	var cpuSamples []resourceSample
+	cpuCores := []float64{0.9, 0.95, 1.0, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8, 1.9}
+	cpuTimeStamp := testTimestamp
+	for i := 0; i < 10; i++ {
+		cpuTimeStamp = cpuTimeStamp.Add(1 * time.Minute)
+		cpuSamples = append(cpuSamples, resourceSample{cpuCores[i], 1.0, cpuTimeStamp})
 	}
-	memoryPeaksHistogram := addTestMemoryHistogram(memSamples, 1.0, testTimestamp, config.MemoryHistogramOptions)
 
-	ResourcePercentile := 0.9 // Same as in podResourceRecommender for target estimator
-	resourceEstimation := GetPercentileResourceEstimation(ResourcePercentile, ResourcePercentile,
-		cpuHistogram, memoryPeaksHistogram)
+	var memSamples []resourceSample
+	memorySample := 1e6
+	memTimeStamp := testTimestamp
+	for i := 0; i < 20; i++ {
+		if i%2 == 0 {
+			memorySample += float64(100 * i)
+		} else {
+			memorySample -= float64(100 * i)
+		}
 
-	resourceRecommendation := model.CoresFromCPUAmount(resourceEstimation[model.ResourceCPU])
-	cpuRequestsToLimitsRatio := float64(testLimit[model.ResourceCPU] / testRequest[model.ResourceCPU])
-	newCPULimitBasedOnRecommendation := cpuRequestsToLimitsRatio * float64(testLimit[model.ResourceCPU])
-	// calculate 90% of post recommendation CPU limits value
-	cpuThrottleLimit := 0.9 * model.CoresFromCPUAmount(model.ResourceAmount(newCPULimitBasedOnRecommendation))
+		memTimeStamp = memTimeStamp.Add(1 * time.Minute)
+		memSamples = append(memSamples, resourceSample{memorySample, 1.0, memTimeStamp})
+	}
 
-	// assert if the current CPU recommendation >= 90% of CPU Limits post recommendation
-	// This should hence show a requirement of RecordCPUThrottle like containerState.RecordOOM
-	// which bumps the CPU sample by some value before adding it to the histogram
-	assert.LessOrEqual(t, resourceRecommendation, cpuThrottleLimit)
+	containerStateMap := getTestContainerStateMap(cpuHistogram, memoryHistogram)
+	recommender := logic.CreatePodResourceRecommender()
+
+	doTestRecommender(
+		cpuHistogram,
+		memoryHistogram,
+		cpuSamples,
+		memSamples,
+		recommender,
+		containerStateMap,
+		func(recommendedResources logic.RecommendedPodResources) {
+			assert.NotEmpty(t, recommendedResources)
+		},
+		func() {
+			recommendedResources = recommender.GetRecommendedPodResources(containerStateMap)
+			assert.NotEmpty(t, recommendedResources)
+			resourceRecommendation = model.CoresFromCPUAmount(recommendedResources[testCtrName].Target[model.ResourceCPU])
+			cpuRequestsToLimitsRatio := float64(recommenderTestLimit[model.ResourceCPU] / recommenderTestRequest[model.ResourceCPU])
+			newCPULimitBasedOnRecommendation := cpuRequestsToLimitsRatio * float64(recommenderTestLimit[model.ResourceCPU])
+			// calculate 90% of post recommendation CPU limits value
+			cpuThrottleLimit = 0.9 * model.CoresFromCPUAmount(model.ResourceAmount(newCPULimitBasedOnRecommendation))
+		},
+		func() {
+			// assert if the current CPU recommendation >= 90% of CPU Limits post recommendation
+			// This should hence show a requirement of RecordCPUThrottle like containerState.RecordOOM
+			// which bumps the CPU sample by some value before adding it to the histogram
+			assert.LessOrEqual(t, resourceRecommendation, cpuThrottleLimit)
+		},
+	)
+}
+
+func TestRecommenderScaleUp(t *testing.T) {
+	var recommendedResources logic.RecommendedPodResources
+	cpuHistogram := util.NewHistogram(config.CPUHistogramOptions)
+	memoryHistogram := util.NewHistogram(config.MemoryHistogramOptions)
+	weights := []float64{0.5, 0.5, 0.5, 0.7, 0.7, 0.7, 0.9, 0.9, 0.9, 0.9}
+
+	var cpuSamples []resourceSample
+	cpuCores := []float64{1.0, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5}
+	cpuTimeStamp := testTimestamp
+	for i := 0; i < 10; i++ {
+		cpuTimeStamp = cpuTimeStamp.Add(1 * time.Minute)
+		cpuSamples = append(cpuSamples, resourceSample{cpuCores[i], weights[i], cpuTimeStamp})
+	}
+
+	var memSamples []resourceSample
+	memTimeStamp := testTimestamp
+	memorySample := 1e6
+	for i := 1; i <= 10; i++ {
+		if i%2 == 0 {
+			memorySample += float64(100 * i)
+		} else {
+			memorySample -= float64(100 * i)
+		}
+
+		memTimeStamp = memTimeStamp.Add(1 * time.Minute)
+		memSamples = append(memSamples, resourceSample{memorySample, 1.0, memTimeStamp})
+	}
+
+	containerStateMap := getTestContainerStateMap(cpuHistogram, memoryHistogram)
+	recommender := logic.CreatePodResourceRecommender()
+
+	doTestRecommender(
+		cpuHistogram,
+		memoryHistogram,
+		cpuSamples,
+		memSamples,
+		recommender,
+		containerStateMap,
+		func(recommendedResources logic.RecommendedPodResources) {
+			assert.InEpsilon(t, 1.737, model.CoresFromCPUAmount(recommendedResources[testCtrName].Target[model.ResourceCPU]), maxRelativeError)
+			assert.InEpsilon(t, 2.62144000e8, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
+		},
+		func() {
+			increasedCPUCores := []float64{1.5, 1.55, 1.6, 1.65, 1.7, 1.75, 1.75, 1.75, 1.75, 1.75}
+			for i := 0; i < 10; i++ {
+				cpuTimeStamp = cpuTimeStamp.Add(1 * time.Minute)
+				cpuSamples = append(cpuSamples, resourceSample{increasedCPUCores[i], weights[i], cpuTimeStamp})
+			}
+			addTestCPUHistogram(cpuHistogram, cpuSamples)
+
+			for i := 0; i < 10; i++ {
+				memTimeStamp = memTimeStamp.Add(1 * time.Minute)
+				memSamples = append(memSamples, resourceSample{float64(1e9 + i*100), weights[i], memTimeStamp})
+			}
+			addTestMemoryHistogram(memoryHistogram, memSamples)
+
+			recommendedResources = recommender.GetRecommendedPodResources(containerStateMap)
+			assert.NotEmpty(t, recommendedResources)
+		},
+		func() {
+			assert.InEpsilon(t, 2.048, model.CoresFromCPUAmount(recommendedResources[testCtrName].Target[model.ResourceCPU]), maxRelativeError)
+			assert.InEpsilon(t, 1.168723596e9, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
+			assert.InEpsilon(t, 0.025, model.CoresFromCPUAmount(recommendedResources[testCtrName].LowerBound[model.ResourceCPU]), maxRelativeError)
+			assert.InEpsilon(t, 2.62144000e8, model.BytesFromMemoryAmount(recommendedResources[testCtrName].LowerBound[model.ResourceMemory]), maxRelativeError)
+			assert.InEpsilon(t, 1e11, model.CoresFromCPUAmount(recommendedResources[testCtrName].UpperBound[model.ResourceCPU]), maxRelativeError)
+			assert.InEpsilon(t, 1e14, model.BytesFromMemoryAmount(recommendedResources[testCtrName].UpperBound[model.ResourceMemory]), maxRelativeError)
+		},
+	)
+}
+
+func TestRecommenderScaleDown(t *testing.T) {
+	var recommendedResources logic.RecommendedPodResources
+	cpuHistogram := util.NewHistogram(config.CPUHistogramOptions)
+	memoryHistogram := util.NewHistogram(config.MemoryHistogramOptions)
+	weights := []float64{0.5, 0.5, 0.5, 0.7, 0.7, 0.7, 0.9, 0.9, 0.9, 0.9}
+
+	var cpuSamples []resourceSample
+	cpuCores := []float64{0.9, 0.8, 0.7, 0.6, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5}
+	cpuTimeStamp := testTimestamp
+	for i := 0; i < 10; i++ {
+		cpuTimeStamp = cpuTimeStamp.Add(1 * time.Minute)
+		cpuSamples = append(cpuSamples, resourceSample{cpuCores[i], weights[i], cpuTimeStamp})
+	}
+
+	var memSamples []resourceSample
+	memTimeStamp := testTimestamp
+	memorySample := 1e5
+	for i := 1; i <= 10; i++ {
+		memorySample -= float64(i * 1000)
+		memTimeStamp = memTimeStamp.Add(1 * time.Minute)
+		memSamples = append(memSamples, resourceSample{memorySample, 1.0, memTimeStamp})
+	}
+
+	containerStateMap := getTestContainerStateMap(cpuHistogram, memoryHistogram)
+	recommender := logic.CreatePodResourceRecommender()
+
+	doTestRecommender(
+		cpuHistogram,
+		memoryHistogram,
+		cpuSamples,
+		memSamples,
+		recommender,
+		containerStateMap,
+		func(recommendedResources logic.RecommendedPodResources) {
+			assert.InEpsilon(t, 0.92, model.CoresFromCPUAmount(recommendedResources[testCtrName].Target[model.ResourceCPU]), maxRelativeError)
+			assert.InEpsilon(t, 2.62144000e8, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
+		},
+		func() {
+			decreasedCPUCores := []float64{0.3, 0.3, 0.3, 0.2, 0.2, 0.2, 0.2, 0.1, 0.1, 0.05}
+			recentWeights := []float64{0.9, 0.9, 0.9, 0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
+			for i := 0; i < 10; i++ {
+				cpuTimeStamp = cpuTimeStamp.Add(1 * time.Minute)
+				cpuSamples = append(cpuSamples, resourceSample{decreasedCPUCores[i], recentWeights[i], cpuTimeStamp})
+			}
+			addTestCPUHistogram(cpuHistogram, cpuSamples)
+
+			for i := 0; i < 10; i++ {
+				memTimeStamp = memTimeStamp.Add(1 * time.Minute)
+				memSamples = append(memSamples, resourceSample{float64(1e5 - i*1000), weights[i], memTimeStamp})
+			}
+			addTestMemoryHistogram(memoryHistogram, memSamples)
+
+			recommendedResources = recommender.GetRecommendedPodResources(containerStateMap)
+			assert.NotEmpty(t, recommendedResources)
+		},
+		func() {
+			assert.InEpsilon(t, 0.813, model.CoresFromCPUAmount(recommendedResources[testCtrName].Target[model.ResourceCPU]), maxRelativeError)
+			assert.InEpsilon(t, 2.62144000e8, model.BytesFromMemoryAmount(recommendedResources[testCtrName].Target[model.ResourceMemory]), maxRelativeError)
+			assert.InEpsilon(t, 0.025, model.CoresFromCPUAmount(recommendedResources[testCtrName].LowerBound[model.ResourceCPU]), maxRelativeError)
+			assert.InEpsilon(t, 2.62144000e8, model.BytesFromMemoryAmount(recommendedResources[testCtrName].LowerBound[model.ResourceMemory]), maxRelativeError)
+			assert.InEpsilon(t, 1e11, model.CoresFromCPUAmount(recommendedResources[testCtrName].UpperBound[model.ResourceCPU]), maxRelativeError)
+			assert.InEpsilon(t, 1e14, model.BytesFromMemoryAmount(recommendedResources[testCtrName].UpperBound[model.ResourceMemory]), maxRelativeError)
+		},
+	)
 }
